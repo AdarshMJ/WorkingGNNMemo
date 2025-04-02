@@ -130,10 +130,7 @@ def perform_dimensionality_statistical_tests(node_scores, dim_results, logger=No
 
 def plot_memorization_dimensionality(node_scores, model_f, model_g, data, save_path, device):
     """Create bar plot comparing dimensionality of memorized vs non-memorized nodes"""
-    
-    # Set figure size and style
-    #plt.style.use('seaborn')
-    plt.figure(figsize=(15, 8))
+    plt.figure(figsize=(12, 6))
     
     # Get embeddings from both models
     f_embeddings = get_embeddings(model_f, data, device)
@@ -143,7 +140,6 @@ def plot_memorization_dimensionality(node_scores, model_f, model_g, data, save_p
     node_types = ['shared', 'candidate', 'independent', 'extra']
     bar_positions = np.arange(len(node_types)) * 3
     
-    # Calculate dimensionality for each node type
     for i, node_type in enumerate(node_types):
         if node_type not in node_scores:
             continue
@@ -181,56 +177,38 @@ def plot_memorization_dimensionality(node_scores, model_f, model_g, data, save_p
         if non_mem_dims is not None:
             results[f'{node_type}_non_memorized'] = torch.mean(non_mem_dims).item()
     
-    # Calculate statistical results before plotting
-    stats_results = perform_dimensionality_statistical_tests(node_scores, results)
-    
-    # Create grouped bar plot with improved styling
-    bar_width = 0.7  # Increased bar width
+    # Create grouped bar plot
+    bar_width = 0.35
     
     memorized_values = [results.get(f'{nt}_memorized', 0) for nt in node_types]
     non_memorized_values = [results.get(f'{nt}_non_memorized', 0) for nt in node_types]
     
-    # Set a minimum y-axis limit to prevent squishing
-    max_value = max(max(memorized_values), max(non_memorized_values))
-    plt.ylim(0, max_value * 1.2)  # Add 20% padding at the top
+    plt.bar(bar_positions - bar_width/2, memorized_values, bar_width, 
+            label='Memorized (>0.5)', color='blue', alpha=0.7)
+    plt.bar(bar_positions + bar_width/2, non_memorized_values, bar_width,
+            label='Non-memorized (≤0.5)', color='orange', alpha=0.7)
     
-    bars1 = plt.bar(bar_positions - bar_width/2, memorized_values, bar_width, 
-                    label='Memorized (>0.5)', color='royalblue', alpha=0.8)
-    bars2 = plt.bar(bar_positions + bar_width/2, non_memorized_values, bar_width,
-                    label='Non-memorized (≤0.5)', color='darkorange', alpha=0.8)
+    plt.xlabel('Node Type')
+    plt.ylabel('Average Max Data Dimensionality')
+    plt.title('Max Data Dimensionality: Memorized vs Non-memorized Nodes')
+    plt.xticks(bar_positions, node_types)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    plt.xlabel('Node Type', fontsize=12, labelpad=10)
-    plt.ylabel('Average Max Data Dimensionality', fontsize=12, labelpad=10)
-    plt.title('Max Data Dimensionality: Memorized vs Non-memorized Nodes', fontsize=14, pad=20)
+    # Add value labels on top of bars
+    def add_value_labels(positions, values, offset):
+        for pos, val in zip(positions, values):
+            if val != 0:  # Only add label if value exists
+                plt.text(pos + offset, val, f'{val:.3f}', 
+                        ha='center', va='bottom')
     
-    # Improve x-ticks
-    plt.xticks(bar_positions, [t.capitalize() for t in node_types], fontsize=11)
-    plt.yticks(fontsize=10)
+    add_value_labels(bar_positions, memorized_values, -bar_width/2)
+    add_value_labels(bar_positions, non_memorized_values, bar_width/2)
     
-    # Move legend outside the plot
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11)
+    # Perform statistical tests
+    stats_results = perform_dimensionality_statistical_tests(node_scores, results, logger=None)
     
-    # Add grid only for y-axis and make it lighter
-    plt.grid(True, axis='y', alpha=0.2)
-    
-    def add_value_labels(bars, offset):
-        """Add value labels on top of bars with improved positioning"""
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:  # Only add label if value exists
-                plt.text(
-                    bar.get_x() + bar.get_width()/2,
-                    height + max_value * 0.01,  # Slight offset from bar top
-                    f'{height:.3f}',
-                    ha='center',
-                    va='bottom',
-                    fontsize=10
-                )
-    
-    add_value_labels(bars1, -bar_width/2)
-    add_value_labels(bars2, bar_width/2)
-    
-    # Add statistical significance markers with better positioning
+    # Add statistical significance markers to plot if significant
     for node_type in node_types:
         if node_type in stats_results and stats_results[node_type]['pvalue'] is not None:
             if stats_results[node_type]['pvalue'] < 0.01:
@@ -242,24 +220,16 @@ def plot_memorization_dimensionality(node_scores, model_f, model_g, data, save_p
             else:
                 continue
                 
+            # Add significance marker
             idx = node_types.index(node_type)
             max_height = max(
                 results.get(f'{node_type}_memorized', 0),
                 results.get(f'{node_type}_non_memorized', 0)
             )
-            plt.text(
-                bar_positions[idx],
-                max_height + max_value * 0.05,  # Position marker higher above bars
-                marker,
-                ha='center',
-                va='bottom',
-                fontsize=12
-            )
+            plt.text(bar_positions[idx], max_height + 0.02, marker,
+                    ha='center', va='bottom')
     
-    # Adjust layout to prevent label cutoff
-    plt.tight_layout(rect=[0, 0, 0.9, 1])  # Leave space for the legend
-    
-    # Save with high resolution
+    plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     

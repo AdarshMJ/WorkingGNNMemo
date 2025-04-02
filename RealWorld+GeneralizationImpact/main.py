@@ -652,30 +652,30 @@ def main():
                 logger.info(f"  P-value: {label_data['stat_test']['pvalue']:.2e}")
     
     # Add centrality analysis
-    # if logger:
-    #     logger.info("\nAnalyzing network centrality measures...")
-    # centrality_measures = analyze_centrality_measures(
-    #     data=data,
-    #     node_scores=node_scores,
-    #     save_path=os.path.join(log_dir, f'centrality_analysis_{timestamp}.png')
-    # )
+    if logger:
+        logger.info("\nAnalyzing network centrality measures...")
+    centrality_measures = analyze_centrality_measures(
+        data=data,
+        node_scores=node_scores,
+        save_path=os.path.join(log_dir, f'centrality_analysis_{timestamp}.png')
+    )
     
-    # # Log centrality analysis results
-    # if logger:
-    #     logger.info("\nCentrality Analysis Results for Candidate Nodes:")
-    #     for measure, values in centrality_measures.items():
-    #         # Calculate average centrality for memorized vs non-memorized nodes
-    #         candidate_data = node_scores['candidate']['raw_data']
-    #         memorized_mask = candidate_data['mem_score'] > 0.5
-    #         memorized_nodes = candidate_data['node_idx'][memorized_mask].values
-    #         non_memorized_nodes = candidate_data['node_idx'][~memorized_mask].values
+    # Log centrality analysis results
+    if logger:
+        logger.info("\nCentrality Analysis Results for Candidate Nodes:")
+        for measure, values in centrality_measures.items():
+            # Calculate average centrality for memorized vs non-memorized nodes
+            candidate_data = node_scores['candidate']['raw_data']
+            memorized_mask = candidate_data['mem_score'] > 0.5
+            memorized_nodes = candidate_data['node_idx'][memorized_mask].values
+            non_memorized_nodes = candidate_data['node_idx'][~memorized_mask].values
             
-    #         mem_centrality = np.mean([values[idx] for idx in memorized_nodes])
-    #         non_mem_centrality = np.mean([values[idx] for idx in non_memorized_nodes])
+            mem_centrality = np.mean([values[idx] for idx in memorized_nodes])
+            non_mem_centrality = np.mean([values[idx] for idx in non_memorized_nodes])
             
-    #         logger.info(f"\n{measure.title()} Centrality:")
-    #         logger.info(f"  Memorized nodes (n={len(memorized_nodes)}): mean = {mem_centrality:.4f}")
-    #         logger.info(f"  Non-memorized nodes (n={len(non_memorized_nodes)}): mean = {non_mem_centrality:.4f}")
+            logger.info(f"\n{measure.title()} Centrality:")
+            logger.info(f"  Memorized nodes (n={len(memorized_nodes)}): mean = {mem_centrality:.4f}")
+            logger.info(f"  Non-memorized nodes (n={len(non_memorized_nodes)}): mean = {non_mem_centrality:.4f}")
     
     ###Perform entropy reliability analysis
     # if logger:
@@ -775,7 +775,7 @@ def main():
         gen_results,
         save_path=gen_plot_path,
         num_memorized_nodes=num_memorized,
-        title_suffix=f"Dataset: {args.dataset}, Model: {args.model_type}"
+        #title_suffix=f"Dataset: {args.dataset}, Model: {args.model_type}"
     )
     logger.info(f"Generalization analysis plot saved to: {gen_plot_path}")
     
@@ -801,19 +801,16 @@ def main():
     
     # Calculate and log average impact
     # Use baseline_test_acc as baseline
-    baseline_mean = np.mean(gen_results['drop_memorized_ranked'][0.0]['test_accs'])
+    baseline_mean = gen_results['baseline_test_acc']
     
     # Get results for ranked memorized nodes
     drop_pcts = list(gen_results['drop_memorized_ranked'].keys())
+    drop_mem_ranked_mean = np.mean([np.mean(gen_results['drop_memorized_ranked'][p]['test_accs']) for p in drop_pcts])
+    drop_mem_ranked_std = np.mean([np.std(gen_results['drop_memorized_ranked'][p]['test_accs']) for p in drop_pcts])
     
-    # Calculate means excluding baseline (0.0)
-    non_baseline_pcts = [p for p in drop_pcts if p > 0]
-    drop_mem_ranked_mean = np.mean([np.mean(gen_results['drop_memorized_ranked'][p]['test_accs']) for p in non_baseline_pcts])
-    drop_mem_ranked_std = np.mean([np.std(gen_results['drop_memorized_ranked'][p]['test_accs']) for p in non_baseline_pcts])
-    
-    # Get results for non-memorized nodes (excluding baseline)
-    drop_non_mem_mean = np.mean([np.mean(gen_results['drop_non_memorized_random'][p]['test_accs']) for p in non_baseline_pcts])
-    drop_non_mem_std = np.mean([np.std(gen_results['drop_non_memorized_random'][p]['test_accs']) for p in non_baseline_pcts])
+    # Get results for non-memorized nodes
+    drop_non_mem_mean = np.mean([np.mean(gen_results['drop_non_memorized_random'][p]['test_accs']) for p in drop_pcts])
+    drop_non_mem_std = np.mean([np.std(gen_results['drop_non_memorized_random'][p]['test_accs']) for p in drop_pcts])
     
     logger.info("\nGeneralization Analysis Summary:")
     logger.info(f"Baseline Test Accuracy: {baseline_mean:.4f}")

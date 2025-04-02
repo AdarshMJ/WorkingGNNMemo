@@ -6,39 +6,144 @@ import copy
 from model import NodeGCN, NodeGAT, NodeGraphConv
 import torch.nn.functional as F
 from tqdm import tqdm
-import scipy.stats as stats
-from torch_geometric.utils import dropout_node
+import types
 
-def train_and_evaluate(model, data, train_mask, val_mask, test_mask, 
-                      lr: float, weight_decay: float, epochs: int, device,
-                      training_edge_index=None) -> Tuple[float, float]:
-    """Train model and return validation and test accuracies
+def mask_nodes_and_edges(data, nodes_to_mask, device):
+    """
+    Mask nodes by zeroing their features and masking their edges in both directions.
+    Returns modified data object and masking statistics.
     
     Args:
-        model: The GNN model to train
-        data: PyG data object
-        train_mask: Mask for training nodes
-        val_mask: Mask for validation nodes
-        test_mask: Mask for test nodes
-        lr: Learning rate
-        weight_decay: Weight decay factor
-        epochs: Number of epochs to train
-        device: Device to train on
-        training_edge_index: Optional modified edge index to use during training (for node dropping)
+        data: PyG Data object
+        nodes_to_mask: List of node indices to mask
+        device: torch device
+    Returns:
+        masked_data: Modified PyG Data object
+        masking_stats: Dictionary of masking statistics
     """
+    # Create a deep copy to avoid modifying the original data
+    masked_data = copy.deepcopy(data)
+    
+    # 1. Zero out node features for masked nodes
+    masked_data.x[nodes_to_mask] = torch.zeros_like(masked_data.x[nodes_to_mask])
+    
+    # 2. Create edge weights (1 for unmasked edges, 0 for masked edges)
+    edge_weights = torch.ones(masked_data.edge_index.size(1), device=device)
+    
+    # Get source and target nodes for each edge
+    src_nodes = masked_data.edge_index[0]
+    dst_nodes = masked_data.edge_index[1]
+    
+    # Create mask for edges where either source or target is in nodes_to_mask
+    masked_edges = torch.isin(src_nodes, torch.tensor(nodes_to_mask, device=device)) | \
+                  torch.isin(dst_nodes, torch.tensor(nodes_to_mask, device=device))
+    
+    # Set weights to 0 for masked edges
+    edge_weights[masked_edges] = 0
+    
+    # Calculate statistics
+    total_edges = masked_data.edge_index.size(1)
+    masked_edges_count = masked_edges.sum().item()
+    total_nodes = masked_data.x.size(0)
+    
+    # Calculate degree statistics
+    degrees = torch.bincount(masked_data.edge_index.flatten())
+    avg_degree_before = degrees.float().mean().item()
+    
+    # Calculate degrees after masking
+    # Create a boolean mask for valid edges (weight > 0)
+    valid_edges = edge_weights > 0
+    masked_adj = masked_data.edge_index[:, valid_edges]
+    masked_degrees = torch.bincount(masked_adj.flatten())
+    avg_degree_after = masked_degrees.float().mean().item()
+    
+    # Calculate average degree of masked nodes before masking
+    masked_nodes_degrees = degrees[nodes_to_mask].float().mean().item()
+    
+    # Add edge weights to data object
+    masked_data.edge_weights = edge_weights
+    
+    masking_stats = {
+        'masked_nodes': len(nodes_to_mask),
+        'node_masking_percentage': (len(nodes_to_mask) / total_nodes) * 100,
+        'masked_edges': masked_edges_count,
+        'edge_masking_percentage': (masked_edges_count / total_edges) * 100,
+        'avg_degree_before': avg_degree_before,
+        'avg_degree_after': avg_degree_after,
+        'masked_nodes_avg_degree': masked_nodes_degrees
+    }
+    
+    return masked_data, masking_stats
+
+def apply_edge_weights_to_model(model):
+    """
+    Modify the GNN model to use edge weights in message passing.
+    This modifies the model's conv layers to use edge_weights during aggregation.
+    """
+    for module in model.modules():
+        if hasattr(module, 'propagate'):
+            # Store the original message and aggregate functions
+            if not hasattr(module, '_original_aggregate'):
+                module._original_aggregate = module.aggregate
+            if not hasattr(module, '_original_message'):
+                module._original_message = module.message
+            
+            # Override the message function to apply edge weights
+            def weighted_message(self, x_j, edge_weight=None):
+                if edge_weight is not None:
+                    x_j = x_j * edge_weight.view(-1, 1)
+                return x_j
+            
+            # Override the aggregate function to handle all possible arguments
+            def weighted_aggregate(self, inputs, index, ptr=None, dim_size=None):
+                return self._original_aggregate(inputs, index, ptr=ptr, dim_size=dim_size)
+            
+            module.message = types.MethodType(weighted_message, module)
+            module.aggregate = types.MethodType(weighted_aggregate, module)
+
+def forward_with_edge_weights(self, x, edge_index, edge_weights=None, return_node_emb=False):
+    """
+    Modified forward pass that handles edge weights and optionally returns node embeddings.
+    """
+    # First convolution layer
+    x = self.convs[0](x, edge_index, edge_weight=edge_weights)
+    x = F.relu(x)
+    x = F.dropout(x, p=0.5, training=self.training)
+    
+    # Hidden layers
+    for conv in self.convs[1:-1]:
+        x = conv(x, edge_index, edge_weight=edge_weights)
+        x = F.relu(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+    
+    # Get node embeddings before final layer
+    node_embeddings = x.clone()
+    
+    # Final layer
+    x = self.convs[-1](x, edge_index, edge_weight=edge_weights)
+    
+    if return_node_emb:
+        return x, node_embeddings
+    return x
+
+# Update model classes to use the new forward pass
+NodeGCN.forward = forward_with_edge_weights
+NodeGAT.forward = forward_with_edge_weights
+NodeGraphConv.forward = forward_with_edge_weights
+
+def train_and_evaluate(model, data, train_mask, val_mask, test_mask, 
+                      lr: float, weight_decay: float, epochs: int, device) -> Tuple[float, float]:
+    """Train model and return validation and test accuracies"""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     best_val_acc = 0
     final_test_acc = 0
     
-    # Use provided edge_index for training if given, otherwise use original
-    train_edge_index = training_edge_index if training_edge_index is not None else data.edge_index
-    
     model.train()
     for epoch in range(epochs):
         optimizer.zero_grad()
-        
-        # Use modified edge_index for training
-        out = model(data.x.to(device), train_edge_index.to(device))
+        # Pass edge_weights if they exist in the data object
+        edge_weights = data.edge_weights if hasattr(data, 'edge_weights') else None
+        out = model(data.x.to(device), data.edge_index.to(device), edge_weights=edge_weights)
         loss = F.cross_entropy(out[train_mask], data.y[train_mask])
         loss.backward()
         optimizer.step()
@@ -46,8 +151,7 @@ def train_and_evaluate(model, data, train_mask, val_mask, test_mask,
         # Evaluate
         model.eval()
         with torch.no_grad():
-            # Use full edge_index for validation and testing
-            out = model(data.x.to(device), data.edge_index.to(device))
+            out = model(data.x.to(device), data.edge_index.to(device), edge_weights=edge_weights)
             val_acc = (out[val_mask].argmax(dim=1) == data.y[val_mask]).float().mean()
             test_acc = (out[test_mask].argmax(dim=1) == data.y[test_mask]).float().mean()
             
@@ -90,32 +194,14 @@ def analyze_generalization_impact(
     # Calculate number of memorized nodes - this will be our maximum drop size
     num_memorized = len(memorized_candidates)
     
-    # Calculate percentages to drop - now including 0.0
-    drop_percentages = [0.0, 0.1, 0.2, 0.5, 1.0]
+    # Calculate percentages to drop
+    drop_percentages = [0.1, 0.2, 0.5, 1.0]
     
     results = {
-        'drop_memorized_ranked': {p: {'val_accs': [], 'test_accs': []} for p in drop_percentages},
-        'drop_non_memorized_random': {p: {'val_accs': [], 'test_accs': []} for p in drop_percentages}
+        'drop_memorized_ranked': {p: {'val_accs': [], 'test_accs': [], 'masking_stats': []} for p in drop_percentages},
+        'drop_non_memorized_random': {p: {'val_accs': [], 'test_accs': [], 'masking_stats': []} for p in drop_percentages}
     }
-    
-    # Run original model once to get baseline accuracy
-    model = get_fresh_model(model_type, data, hidden_dim, num_layers, gat_heads, device)
-    baseline_val_acc, baseline_test_acc = train_and_evaluate(
-        model, data, data.train_mask, data.val_mask, data.test_mask,
-        lr, weight_decay, epochs, device
-    )
-    
-    if logger:
-        logger.info("\nGeneralization Analysis Setup:")
-        logger.info(f"Total memorized nodes: {num_memorized}")
-        logger.info(f"Total non-memorized shared nodes available: {len(non_memorized_shared)}")
-        logger.info(f"Original training mask size: {data.train_mask.sum().item()} nodes")
-        logger.info(f"Baseline test accuracy: {baseline_test_acc:.4f}")
-        logger.info("\nNode dropping schedule:")
-        for pct in drop_percentages[1:]:  # Skip 0% in the log
-            nodes_to_drop = int(num_memorized * pct)
-            logger.info(f"  {pct*100}% = {nodes_to_drop} nodes")
-    
+
     # Run experiments for each seed
     for seed in seeds:
         if logger:
@@ -124,85 +210,94 @@ def analyze_generalization_impact(
         torch.manual_seed(seed)
         np.random.seed(seed)
         
-        # For each percentage
+        # Create baseline model and get baseline accuracy
+        model = get_fresh_model(model_type, data, hidden_dim, num_layers, gat_heads, device)
+        apply_edge_weights_to_model(model)
+        baseline_val_acc, baseline_test_acc = train_and_evaluate(
+            model, data, data.train_mask, data.val_mask, data.test_mask,
+            lr, weight_decay, epochs, device
+        )
+        
         for drop_pct in drop_percentages:
-            # For 0%, just use baseline accuracy
-            if drop_pct == 0.0:
-                results['drop_memorized_ranked'][drop_pct]['val_accs'].append(baseline_val_acc)
-                results['drop_memorized_ranked'][drop_pct]['test_accs'].append(baseline_test_acc)
-                results['drop_non_memorized_random'][drop_pct]['val_accs'].append(baseline_val_acc)
-                results['drop_non_memorized_random'][drop_pct]['test_accs'].append(baseline_test_acc)
-                continue
-                
-            # Calculate number of nodes to drop based on number of memorized nodes
             num_nodes_to_drop = int(num_memorized * drop_pct)
             
             if logger:
                 logger.info(f"\nDropping {num_nodes_to_drop} nodes ({drop_pct*100}% of memorized nodes)")
             
             # 1. Drop top-k memorized nodes
-            # Create training mask excluding memorized nodes
-            drop_memorized_ranked_mask = data.train_mask.clone()
             nodes_to_drop = memorized_candidates[:num_nodes_to_drop]
+            masked_data, mem_masking_stats = mask_nodes_and_edges(data, nodes_to_drop, device)
+            drop_memorized_ranked_mask = data.train_mask.clone()
             drop_memorized_ranked_mask[nodes_to_drop] = False
             
-            # Create node mask for edge dropping
-            node_mask = torch.ones(data.num_nodes, dtype=torch.bool)
-            node_mask[nodes_to_drop] = False
-            
-            # Remove edges connected to dropped nodes
-            edge_mask = node_mask[data.edge_index[0]] & node_mask[data.edge_index[1]]
-            dropped_edge_index = data.edge_index[:, edge_mask]
-            
             if logger:
-                remaining_nodes = drop_memorized_ranked_mask.sum().item()
-                remaining_edges = edge_mask.sum().item()
-                logger.info(f"  Top-k memorized - Remaining training nodes: {remaining_nodes} (dropped {data.train_mask.sum().item() - remaining_nodes})")
-                logger.info(f"  Top-k memorized - Remaining edges: {remaining_edges} (dropped {data.edge_index.size(1) - remaining_edges})")
+                logger.info("\nMemorized nodes masking statistics:")
+                logger.info(f"  Nodes masked: {mem_masking_stats['masked_nodes']} ({mem_masking_stats['node_masking_percentage']:.2f}% of total)")
+                logger.info(f"  Edges masked: {mem_masking_stats['masked_edges']} ({mem_masking_stats['edge_masking_percentage']:.2f}% of total)")
+                logger.info(f"  Average degree before masking: {mem_masking_stats['avg_degree_before']:.2f}")
+                logger.info(f"  Average degree after masking: {mem_masking_stats['avg_degree_after']:.2f}")
+                logger.info(f"  Average degree of masked nodes: {mem_masking_stats['masked_nodes_avg_degree']:.2f}")
             
-            model = get_fresh_model(model_type, data, hidden_dim, num_layers, gat_heads, device)
+            model = get_fresh_model(model_type, masked_data, hidden_dim, num_layers, gat_heads, device)
+            apply_edge_weights_to_model(model)
             val_acc, test_acc = train_and_evaluate(
-                model, data, drop_memorized_ranked_mask, data.val_mask, data.test_mask,
-                lr, weight_decay, epochs, device,
-                training_edge_index=dropped_edge_index
+                model, masked_data, drop_memorized_ranked_mask, 
+                masked_data.val_mask, masked_data.test_mask,
+                lr, weight_decay, epochs, device
             )
             results['drop_memorized_ranked'][drop_pct]['val_accs'].append(val_acc)
             results['drop_memorized_ranked'][drop_pct]['test_accs'].append(test_acc)
+            results['drop_memorized_ranked'][drop_pct]['masking_stats'].append(mem_masking_stats)
             
             # 2. Drop random non-memorized shared nodes
-            drop_non_memorized_mask = data.train_mask.clone()
             random_nodes_to_drop = np.random.choice(non_memorized_shared, num_nodes_to_drop, replace=False)
+            masked_data, non_mem_masking_stats = mask_nodes_and_edges(data, random_nodes_to_drop, device)
+            drop_non_memorized_mask = data.train_mask.clone()
             drop_non_memorized_mask[random_nodes_to_drop] = False
             
-            # Create node mask for edge dropping
-            node_mask = torch.ones(data.num_nodes, dtype=torch.bool)
-            node_mask[random_nodes_to_drop] = False
-            
-            # Remove edges connected to dropped nodes
-            edge_mask = node_mask[data.edge_index[0]] & node_mask[data.edge_index[1]]
-            dropped_edge_index = data.edge_index[:, edge_mask]
-            
             if logger:
-                remaining_nodes = drop_non_memorized_mask.sum().item()
-                remaining_edges = edge_mask.sum().item()
-                logger.info(f"  Random non-memorized - Remaining training nodes: {remaining_nodes} (dropped {data.train_mask.sum().item() - remaining_nodes})")
-                logger.info(f"  Random non-memorized - Remaining edges: {remaining_edges} (dropped {data.edge_index.size(1) - remaining_edges})")
+                logger.info("\nNon-memorized nodes masking statistics:")
+                logger.info(f"  Nodes masked: {non_mem_masking_stats['masked_nodes']} ({non_mem_masking_stats['node_masking_percentage']:.2f}% of total)")
+                logger.info(f"  Edges masked: {non_mem_masking_stats['masked_edges']} ({non_mem_masking_stats['edge_masking_percentage']:.2f}% of total)")
+                logger.info(f"  Average degree before masking: {non_mem_masking_stats['avg_degree_before']:.2f}")
+                logger.info(f"  Average degree after masking: {non_mem_masking_stats['avg_degree_after']:.2f}")
+                logger.info(f"  Average degree of masked nodes: {non_mem_masking_stats['masked_nodes_avg_degree']:.2f}")
             
-            model = get_fresh_model(model_type, data, hidden_dim, num_layers, gat_heads, device)
+            model = get_fresh_model(model_type, masked_data, hidden_dim, num_layers, gat_heads, device)
+            apply_edge_weights_to_model(model)
             val_acc, test_acc = train_and_evaluate(
-                model, data, drop_non_memorized_mask, data.val_mask, data.test_mask,
-                lr, weight_decay, epochs, device,
-                training_edge_index=dropped_edge_index
+                model, masked_data, drop_non_memorized_mask, 
+                masked_data.val_mask, masked_data.test_mask,
+                lr, weight_decay, epochs, device
             )
             results['drop_non_memorized_random'][drop_pct]['val_accs'].append(val_acc)
             results['drop_non_memorized_random'][drop_pct]['test_accs'].append(test_acc)
+            results['drop_non_memorized_random'][drop_pct]['masking_stats'].append(non_mem_masking_stats)
             
             if logger:
-                logger.info(f"\nResults for dropping {drop_pct*100}% nodes ({num_nodes_to_drop} nodes):")
-                logger.info(f"  Top-k memorized - Test Acc: {results['drop_memorized_ranked'][drop_pct]['test_accs'][-1]:.4f}")
-                logger.info(f"  Random non-memorized - Test Acc: {test_acc:.4f}")
+                logger.info(f"\nResults for {drop_pct*100}% drop:")
+                logger.info(f"  Memorized - Test Acc: {test_acc:.4f}")
+                logger.info(f"  Non-memorized - Test Acc: {test_acc:.4f}")
     
-    # No need to store baseline_test_acc separately since it's included in results
+    # Add baseline results
+    results['baseline_test_acc'] = baseline_test_acc
+    
+    # Calculate and log average masking statistics across seeds
+    if logger:
+        logger.info("\nAverage masking statistics across all seeds:")
+        for drop_type in ['drop_memorized_ranked', 'drop_non_memorized_random']:
+            logger.info(f"\n{drop_type.replace('_', ' ').title()}:")
+            for drop_pct in drop_percentages:
+                stats_list = results[drop_type][drop_pct]['masking_stats']
+                avg_stats = {
+                    k: np.mean([s[k] for s in stats_list]) 
+                    for k in stats_list[0].keys()
+                }
+                logger.info(f"\n  {drop_pct*100}% drop:")
+                logger.info(f"    Average edges masked: {avg_stats['masked_edges']:.1f} ({avg_stats['edge_masking_percentage']:.2f}%)")
+                logger.info(f"    Average degree reduction: {avg_stats['avg_degree_before']:.2f} → {avg_stats['avg_degree_after']:.2f}")
+                logger.info(f"    Average degree of masked nodes: {avg_stats['masked_nodes_avg_degree']:.2f}")
+    
     return results
 
 def get_fresh_model(model_type, data, hidden_dim, num_layers, gat_heads, device):
@@ -223,22 +318,24 @@ def plot_generalization_results(results: Dict, save_path: str, num_memorized_nod
     
     # Convert percentages to actual number of nodes
     drop_percentages = list(results['drop_memorized_ranked'].keys())
-    nodes_dropped = [int(pct * num_memorized_nodes) for pct in drop_percentages]
+    nodes_dropped = [0] + [int(pct * num_memorized_nodes) for pct in drop_percentages]  # Add 0 nodes dropped
     
+    # Calculate means and confidence intervals for all points
     def get_stats(data):
         mean = np.mean(data)
         sem = np.std(data) / np.sqrt(len(data))
         ci = 1.96 * sem  # 95% confidence interval
         return mean, ci
-    
+
     # Plot results for each dropping strategy
     for strategy, color, label in [
         ('drop_memorized_ranked', 'red', 'Top-k Memorized'),
         ('drop_non_memorized_random', 'blue', 'Random Non-memorized')
     ]:
-        means = []
-        cis = []
+        means = [results['baseline_test_acc']]  # Start with baseline accuracy
+        cis = [0]  # No confidence interval for baseline point
         
+        # Add results for each dropping percentage
         for pct in drop_percentages:
             test_accs = results[strategy][pct]['test_accs']
             mean, ci = get_stats(test_accs)
@@ -252,14 +349,15 @@ def plot_generalization_results(results: Dict, save_path: str, num_memorized_nod
         plt.errorbar(nodes_dropped, means, yerr=cis, color=color, label=label, 
                     marker='o', capsize=5, capthick=1, markersize=6, 
                     linewidth=2, elinewidth=1)
-        
-        # Make the baseline point (0% dropped) more prominent
-        plt.plot(0, means[0], marker='o', markersize=8, color=color)
     
     # Set y-axis limits to focus on the relevant range
     all_means = []
     all_cis = []
     for strategy in ['drop_memorized_ranked', 'drop_non_memorized_random']:
+        # Include baseline accuracy
+        all_means.append(results['baseline_test_acc'])
+        all_cis.append(0)
+        # Add results for each dropping percentage
         for pct in drop_percentages:
             test_accs = results[strategy][pct]['test_accs']
             mean, ci = get_stats(test_accs)
@@ -272,7 +370,7 @@ def plot_generalization_results(results: Dict, save_path: str, num_memorized_nod
     
     plt.xlabel('Number of Nodes Dropped')
     plt.ylabel('Test Accuracy')
-    plt.title('Impact of Node Dropping Strategies on Model Generalization')
+    #plt.title('Impact of Node Dropping Strategies on Model Generalization')
     
     if title_suffix:
         plt.suptitle(title_suffix, fontsize=12)

@@ -200,8 +200,7 @@ def process_heterophilic_dataset_for_link_prediction(data, val_ratio=0.05, test_
 
 def get_heterophilic_datasets():
     """Return a list of available heterophilic datasets."""
-    return ['cornell', 'texas', 'wisconsin', 'chameleon', 'squirrel', 'actor', 
-            'amazon_ratings', 'roman_empire', 'questions', 'tolokers', 'minesweeper']
+    return ['cornell', 'texas', 'wisconsin', 'chameleon','squirrel','actor', 'amazon_ratings', 'roman_empire', 'questions', 'tolokers', 'minesweeper']
 
 if __name__ == "__main__":
     # Test loading a dataset

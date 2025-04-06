@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 from sklearn.metrics import roc_auc_score
 import random
 import torch_geometric.transforms as T
-from model import *
+from model import LinkGNN, LinkGNN_MLP  # Import the new model class
 from torch_geometric.datasets import Planetoid,Actor, WikipediaNetwork,WebKB
 from train import *
 from torch_geometric.utils import negative_sampling
@@ -150,6 +150,9 @@ def main():
     parser.add_argument('--model_type', type=str, default='gcn',
                         choices=['gcn', 'gat', 'graphconv'],
                         help='GNN model type')
+    parser.add_argument('--decoder', type=str, default='dot',
+                        choices=['dot', 'mlp'],
+                        help='Link decoder type: dot product or MLP')
     
     # Model hyperparameters
     parser.add_argument('--hidden_dim', type=int, default=128,
@@ -160,6 +163,8 @@ def main():
                         help='Number of GNN layers')
     parser.add_argument('--heads', type=int, default=4,
                         help='Number of attention heads for GAT')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                        help='Dropout rate')
     
     # Training parameters
     parser.add_argument('--lr', type=float, default=0.01,
@@ -188,12 +193,14 @@ def main():
     
     # Set up logging
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    logger, log_dir = setup_logging(args.model_type, args.dataset, timestamp)
+    model_name = f"{args.model_type}_{args.decoder}" if args.decoder == 'mlp' else args.model_type
+    logger, log_dir = setup_logging(model_name, args.dataset, timestamp)
     
     logger.info(f"Link Prediction Memorization Analysis")
-    logger.info(f"Dataset: {args.dataset}, Model: {args.model_type}")
+    logger.info(f"Dataset: {args.dataset}, Model: {args.model_type}, Decoder: {args.decoder}")
     logger.info(f"Using device: {device}")
     logger.info(f"Split ratios: {args.split_ratios}")
+    logger.info(f"Random seed: {args.seed}")
     
     # Create data transformation
     transform = T.Compose([
@@ -233,9 +240,9 @@ def main():
             neg_edges = edges_dict[edge_type]['neg']
             logger.info(f"  {edge_type.capitalize()} edges: {len(pos_edges)} positive, {len(neg_edges)} negative")
     
-    # Train models
+    # Train models using the fixed version that respects the provided seed
     logger.info("Training models...")
-    model_f, model_g = train_models(data_full, edges_dict, args, logger)
+    model_f, model_g = train_models_fixed(data_full, edges_dict, args, logger)
     
     # Calculate memorization scores
     logger.info("Calculating edge memorization scores...")
@@ -250,13 +257,13 @@ def main():
     
     # Create visualization
     logger.info("Creating visualizations...")
-    plot_filename = f'link_memorization_{args.model_type}_{args.dataset}_{timestamp}.png'
+    plot_filename = f'link_memorization_{model_name}_{args.dataset}_{timestamp}.png'
     plot_path = os.path.join(log_dir, plot_filename)
     
     plot_edge_memorization_analysis(
         edge_scores=edge_scores,
         save_path=plot_path,
-        title_suffix=f"Link Prediction Memorization - {args.dataset}, {args.model_type.upper()}",
+        title_suffix=f"Link Prediction Memorization - {args.dataset}, {args.model_type.upper()}, {args.decoder.upper()} decoder",
         edge_types_to_plot=['shared', 'candidate', 'independent', 'extra']
     )
     
